@@ -1,5 +1,4 @@
-/**
- * RPiPlay - An open-source AirPlay mirroring server for Raspberry Pi
+/** * RPiPlay - An open-source AirPlay mirroring server for Raspberry Pi
  * Copyright (C) 2019 Florian Draschbacher
  * Modified extensively to become 
  * UxPlay - An open-souce AirPlay mirroring server.
@@ -42,6 +41,7 @@
 #include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
+#include <ws2tcpip.h>
 #else
 #include <glib-unix.h>
 #include <sys/utsname.h>
@@ -49,6 +49,9 @@
 #include <ifaddrs.h>
 #include <sys/types.h>
 #include <pwd.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 # ifdef __linux__
 # include <netpacket/packet.h>
 # else
@@ -63,6 +66,8 @@
 #include "lib/stream.h"
 #include "lib/logger.h"
 #include "lib/dnssd.h"
+#include "lib/utils.h"
+#include "lib/crypto.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #ifdef DBUS
@@ -89,6 +94,7 @@
   #define DEFAULT_SRGB_FIX false
 #endif
 
+static std::string program_name;
 static std::string server_name = DEFAULT_NAME;
 static dnssd_t *dnssd = NULL;
 static raop_t *raop = NULL;
@@ -137,6 +143,9 @@ static bool fullscreen = false;
 static bool render_coverart = false;
 static std::string coverart_filename = "";
 static std::string metadata_filename = "";
+static std::string ble_filename = "";
+static uint32_t myipv4;
+static std::string myipv4_str;
 static bool do_append_hostname = true;
 static bool use_random_hw_addr = false;
 static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
@@ -328,6 +337,51 @@ static bool file_has_write_access (const char * filename) {
     }
     return write;
 }
+
+/* structure of the BLE file, 58 bytes.
+
+(6)  AdvAddr[6] a random 6-byte private non-resolvable address, like a MAC address.
+(32) Data[32]
+(4)  PID of uxplay process that created the file (given as a uint32_t integer <= PID_MAX = 4194304 = 2^22)
+(16) null-terminated string containing up to first 15 characters of process name of that uxplay process.
+
+Bluetooth HCI commands to broadcast advertisement:
+
+unsigned char on  = 0x01;
+unsigned char off = 0x00;
+unsigned char configuration[15] { 0xa0, 0x00, 0xa0, 0x00, 0x03, 0x01,
+                                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                  0x07, 0x00 };
+Adv_Intrvl_min: 0x00a0; Adv_Intrvl_max: 0x00a0; Adv_type: ADV_NONCONN_IND = 0x03; Own_Addr_type: Random = 0x01;
+Direct_Addr_type: public = 0x00; Direct_Addr: 0x00, 0x00, 0x00, 0x00, 0x00, 0x00;
+Adv_channels: 0x7 = 00000111 = all 3 channels; adv_filter: allow scan + connect request from any client = 0x00. 
+
+The interval between broadcasts of the advertisement will be in the range  [Adv_Intrvl_min , Adv_Intrvl_max],
+where 0x00a0 = 0.1 sec <= Adv_Intrvl_min <= Adv_Intrvl_max <= 0x4000 = 10.24 sec.   Note that 0xabcd
+is entered as (0xcd, 0xab).   The choice Ad_Intrvl_max = Adv_Intrvl_min fixes the interval, and is not 
+recommended if use of the Bluetooth socket is shared with other tasks.
+
+unsigned char AdvAddr[6]
+unsigned_char Data[32] = Advertising_Data_Length[1] + Advertising_Data[31] 
+here Advertising_Data_Length = 0x0f = 15 
+
+HCI commands (sock is an open HCI socket), e.g., from BlueZ.
+                   
+hci_send_cmd(sock, 0x08, 0x0006, 16, configuration)
+hci_send_cmd(sock, 0x08, 0x0005,  6, AdvAddr)
+hci_send_cmd(sock, 0x08, 0x0008, 1 + Data[0], Data) 
+
+hci_send_cmd(sock, 0x08, 0x000a,  1, &on)                 (set Advertising_Enabled to "enabled")
+hci_send_cmd(sock, 0x08, 0x000a,  1, &off)                (set Advertising_Enabled to "disabled"
+
+See e.g. BLUETOOTH SPECIFICATION Version 4.2 [ Vol2, part E, section 7.8 pp 962-976 ]
+(dated December 2014, obsolete)
+*/
+
+/* replace ( 0xff, 0xff, 0xff, 0xff ) below by the IPv4 e.g. ( 0xc0, 0xa8, 0x01, 0x0a ) for 192.168.1.10 */
+static unsigned char ble_advertisement[32] {
+    0x0f, 0x02, 0x01, 0x1a, 0x0b, 0xff, 0x4c, 0x00,  0x09, 0x06, 0x03, 0x30, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 /* 95 byte png file with a 1x1 white square (single pixel): placeholder for coverart*/
 static const unsigned char empty_image[] = {
@@ -711,11 +765,183 @@ static std::string find_uxplay_config_file() {
     return no_config_file;
 }
 
+static bool ipv4_is_local(unsigned int ip) {
+    if ((ip >= 0x0A000000 && ip <= 0x0AFFFFFF) ||   //Class A local    
+        (ip >= 0xAC100000 && ip <= 0xAC1FFFFF) ||   //Class B loca;;
+        (ip >= 0xC0A80000 && ip <= 0xC0A8FFFF)) { //Class C local
+    return true;
+  }
+  return false;
+}
+
+#define PID_MAX_ 4194304
+uint32_t  get_pid() {
+#ifdef _WIN32
+    DWORD pid = GetCurrentProcessId();
+    g_assert (pid <= PID_MAX_);
+    return (uint32_t) pid;  
+#else
+    pid_t pid = getpid();
+    g_assert (pid <= PID_MAX_ && pid >= 0);
+    return (uint32_t) pid;
+#endif
+}
+
+int ble_update(const char *filename) {
+    int count = 0;
+    char name[16] { 0 };
+    FILE * ble_datafile = fopen(filename, "w");
+    if (ble_datafile == NULL) {
+        LOGE("could not open file %s for BLE discovery data", filename);
+        return count;
+    }
+
+    /* write 6 random bytes */
+    unsigned char adv_addr[6];
+    get_random_bytes(adv_addr, 6);
+    /* address is private non-resolvable */
+    adv_addr[0]= adv_addr[0] % 64;
+    
+    count += (int) fwrite(adv_addr, 1, 6, ble_datafile);
+
+    /* increment counter in advertisement */
+    ble_advertisement[11]++;
+    
+    count += (int) fwrite(ble_advertisement, 1, 32, ble_datafile);
+
+    uint32_t pid = get_pid();
+    count +=  (int) fwrite(&pid, 1, sizeof(uint32_t), ble_datafile);
+
+    if (!program_name.empty()) {
+        memcpy(name, program_name.c_str(), program_name.size() > 15 ? 15 : program_name.size());
+        count += (int) fwrite(name, 1, sizeof(name), ble_datafile);
+    }
+
+    fclose(ble_datafile);
+    return count;
+}
+
+static bool add_ipv4_to_ble_adv(unsigned int *ip, const char *ipaddr) {
+    bool success = false;
+    unsigned int netaddr = htonl(*ip); 
+    unsigned char pattern[4] = { 0xff, 0xff, 0xff, 0xff };
+    unsigned char * pos = ble_advertisement + 12;
+    if (memcmp(pos, pattern, 4) == 0) {
+        memcpy(pos , &netaddr, 4);
+        success = true;
+        std::string data;
+        char octet[4];
+        for (int i = 0; i < 32; i++) {
+            snprintf(octet, 4, "%2.2x ", ble_advertisement[i]);
+            data.append(octet);
+            if ((i + 1) % 16 == 0) {
+                data.append("\n");
+            }
+        }
+        LOGD("created BLE advertisement for IP %s:\n%s", ipaddr, data.c_str());
+    }
+    return success;
+}
+
+void find_local_ipv4_for_ble () {
+/*  finds a local IP address of a network interface *
+ *  in a Windows, Linux, *BSD or macOS system.   */
+    if (!myipv4_str.empty()) {
+        LOGI("User-supplied IPv4=%s will be used for the Bluetooth LE advertisement.", myipv4_str.c_str());
+        add_ipv4_to_ble_adv(&myipv4, myipv4_str.c_str());
+        return;
+    }
+    std::vector<uint32_t> ipbin_v4;
+    std::vector<std::string> ipstr_v4;
+    std::vector<std::string> ipname_v4;    
+#ifdef _WIN32
+    ULONG buflen = sizeof(IP_ADAPTER_ADDRESSES);
+    PIP_ADAPTER_ADDRESSES addresses = (IP_ADAPTER_ADDRESSES*) malloc(buflen);
+    if (addresses == NULL) {
+        LOGE("Failed to get IP_ADAPTER_ADDRESSES");
+        goto win32_end;
+    }
+    if (GetAdaptersAddresses(AF_INET, 0, NULL, addresses, &buflen) == ERROR_BUFFER_OVERFLOW) {
+        free(addresses);
+        addresses = (IP_ADAPTER_ADDRESSES*) malloc(buflen);
+        if (addresses == NULL) {
+            LOGE("No ipv4 IP addresses found");
+            goto win32_end;
+        }
+    }
+    if (GetAdaptersAddresses(AF_INET, 0, NULL, addresses, &buflen) == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES address = addresses; address != NULL; address = address->Next) {
+            if (address->PhysicalAddressLength != 6 ||              /* MAC has 6 octets */
+                (address->IfType != 6 && address->IfType != 71) ||  /* Ethernet or Wireless interface */
+                address->OperStatus != 1) {                      /* interface is up */
+                continue;
+            }
+
+            PIP_ADAPTER_UNICAST_ADDRESS u_address = address->FirstUnicastAddress;
+            while (u_address) {
+                if (u_address->Address.lpSockaddr->sa_family == AF_INET) {
+                    SOCKADDR_IN* sa = (SOCKADDR_IN *) u_address->Address.lpSockaddr;
+                    uint32_t ip = (uint32_t) ntohl(sa->sin_addr.s_addr);
+                    char ipaddr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &(sa->sin_addr), ipaddr, sizeof(ipaddr));
+                    if (ipv4_is_local(ip)) {
+                        ipbin_v4.push_back(ip);
+                        ipstr_v4.push_back(ipaddr);
+                        ipname_v4.push_back(address->AdapterName);
+                    }
+                }
+                u_address = u_address->Next;
+            }
+        }
+    }
+    free(addresses);
+ win32_end:
+#else
+    struct ifaddrs *ifap, *ifaptr;
+    bool local;
+    int non_null_octets = 0;
+    unsigned char octet[6];
+    if (getifaddrs(&ifap) == 0) {
+        // look for a local ipv4 address on iface (perhaps future task: implement for ipv6 too)
+        for(ifaptr = ifap; ifaptr != NULL; ifaptr = ifaptr->ifa_next) {
+            if (ifaptr->ifa_addr == NULL ||
+                ifaptr->ifa_addr->sa_family != AF_INET ||
+                !(ifaptr->ifa_flags & IFF_RUNNING)) {
+                continue;
+            }
+            struct sockaddr_in *sa = (struct sockaddr_in *) ifaptr->ifa_addr;
+            uint32_t ip = (uint32_t) ntohl(sa->sin_addr.s_addr);
+            char ipaddr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(sa->sin_addr), ipaddr, sizeof(ipaddr));
+            if (ipv4_is_local(ip)) {
+                ipbin_v4.push_back(ip);
+                ipstr_v4.push_back(ipaddr);
+                ipname_v4.push_back(ifaptr->ifa_name);
+            }
+        }
+    }
+    freeifaddrs(ifap);
+#endif
+    if (ipstr_v4.empty()) {
+        LOGE("failed to find a local ipv4 address for a BLE advertisement:");
+        LOGI("    If one exists but was not found, specify its IPv4 address with option \"-bleIP aa:bb:cc:dd\"");
+        exit(1);
+    } else {
+        LOGI("Local IPv4 addresses of active network adapters found are listed below:\n"
+             "the first one listed will  be used for the Bluetooth LE advertisement.\n"
+             "(to override this choice, specify an IPv4 address with option \"-bleip aa:bb:cc:dd\")");
+        for (int i = 0; i < ipstr_v4.size(); i++) {
+            LOGI("  %d: %s %s\n", i + 1, ipstr_v4[i].c_str(), ipname_v4[i].c_str());
+        }
+        add_ipv4_to_ble_adv(&ipbin_v4[0], ipstr_v4[0].c_str());
+    }
+}
+
 static std::string find_mac () {
 /*  finds the MAC address of a network interface *
  *  in a Windows, Linux, *BSD or macOS system.   */
     std::string mac = "";
-    char str[3];
+    char str[4];
 #ifdef _WIN32
     ULONG buflen = sizeof(IP_ADAPTER_ADDRESSES);
     PIP_ADAPTER_ADDRESSES addresses = (IP_ADAPTER_ADDRESSES*) malloc(buflen);
@@ -742,13 +968,13 @@ static std::string find_mac () {
                 mac = mac + str;
                 if (i < 5) mac = mac + ":";
             }
-	    break;
+            break;
         }
     }
     free(addresses);
-    return mac;
 #else
     struct ifaddrs *ifap, *ifaptr;
+    bool local;
     int non_null_octets = 0;
     unsigned char octet[6];
     if (getifaddrs(&ifap) == 0) {
@@ -778,15 +1004,13 @@ static std::string find_mac () {
                 break;
             }
         }
+        freeifaddrs(ifap);
     }
-    freeifaddrs(ifap);
 #endif
     return mac;
 }
 
-#define MULTICAST 0
-#define LOCAL 1
-#define OCTETS 6
+
 
 static bool validate_mac(char * mac_address) {
     char c;
@@ -806,16 +1030,16 @@ static bool validate_mac(char * mac_address) {
 }
 
 static std::string random_mac () {
-    char str[3];
-    int octet = rand() % 64;
-    octet = (octet << 1) + LOCAL;
-    octet = (octet << 1) + MULTICAST;
-    snprintf(str,3,"%02x",octet);
+    char str[4];
+    unsigned char random[6];
+    get_random_bytes(random, sizeof(random));
+    /* mark MAC address as locally administered, i.e. random */
+    random[0] = random[0] & ~0x01;
+    random[0] = random[0] | 0x02;
+    snprintf(str,3,"%2.2x", random[0]);
     std::string mac_address(str);
-    for (int i = 1; i < OCTETS; i++) {
-        mac_address = mac_address + ":";
-        octet =  rand() % 256;
-        snprintf(str,3,"%02x",octet);
+    for (int i = 1; i < 6; i++) {
+        snprintf(str,4,":%2.2x", random[i]);
         mac_address = mac_address + str;
     }
     return mac_address;
@@ -908,6 +1132,8 @@ static void print_info (char *name) {
     printf("          =1,2,..; fn=\"audiodump\"; change with \"-admp [n] filename\".\n");
     printf("          x increases when audio format changes. If n is given, <= n\n");
     printf("          audio packets are dumped. \"aud\"= unknown format.\n");
+    printf("-ble <fn> Write bluetooth LE service discovery advert to file <fn>\n");
+    printf("-bleIP IP Advertise IPv4=XXX.XXX.XXX.XXX (override uxplay's choice)\n");
     printf("-d [n]    Enable debug logging; optional: n=1 to skip normal packet data\n");
     printf("-v        Displays version information\n");
     printf("-h        Displays this help\n");
@@ -1049,6 +1275,32 @@ static void append_hostname(std::string &server_name) {
 #endif
 }
 
+uint32_t parse_ipv4(const char *ip) {
+    unsigned int ipv4 = 0;
+    const char *ptr = ip; 
+    char *endptr;
+    for (int i = 0; i < 4; i++)  {
+        unsigned long octet = strtoul(ptr, &endptr, 10);
+        if (octet > 255) {
+            return 0;
+        }
+        ipv4 += (uint8_t) octet;
+        if (i == 3) {
+            if (*endptr != '\0') {
+                return 0;
+            } else {
+                return ipv4;
+            }
+        } else {
+            ipv4 *= 256;
+            if (!endptr || *endptr != '.') {
+                return 0;
+            }
+            ptr = ++endptr;
+        }
+    }
+}
+  
 static void parse_arguments (int argc, char *argv[]) {
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -1358,6 +1610,32 @@ static void parse_arguments (int argc, char *argv[]) {
                 }   
             } else {
                 fprintf(stderr,"option -md must be followed by a filename for metadata text output\n");
+                exit(1);
+            }
+        } else if (arg  == "-ble" ) {
+            if (option_has_value(i, argc, arg, argv[i+1])) {
+                ble_filename.erase();
+                ble_filename.append(argv[++i]);
+                const char *fn = ble_filename.c_str();
+                if (!file_has_write_access(fn)) {
+                    fprintf(stderr, "%s cannot be written to:\noption \"-ble <fn>\" must be to a file with write access\n", fn);
+                    exit(1);
+                }   
+            } else {
+                fprintf(stderr,"option -ble must be followed by a filename for metadata text output\n");
+                exit(1);
+            }
+        } else if (arg == "-bleIP") {
+            if (option_has_value(i, argc, arg, argv[i+1])) {
+                myipv4 = parse_ipv4(argv[++i]);
+		myipv4_str.erase();
+                if (!myipv4) {
+                    fprintf(stderr,"invalid IPv4 address \"-bleIP %s\": format is  XXX.XXX.XXX.XXX\n", argv[i]);
+                    exit(1);
+                }
+		myipv4_str = argv[i];
+            } else {
+                fprintf(stderr,"missing IPv4 address: format is  \"-bleIP XXX.XXX.XXX.XXX\"\n");
                 exit(1);
             }
         } else if (arg == "-bt709") {
@@ -2537,6 +2815,7 @@ void real_main (int argc, char *argv[]) {
 #else
 int main (int argc, char *argv[]) {
 #endif
+    program_name = argv[0];
     std::vector<char> server_hw_addr;
     std::string config_file = "";
 
@@ -2797,20 +3076,35 @@ int main (int argc, char *argv[]) {
         LOGI("using network ports UDP %d %d %d TCP %d %d %d", udp[0], udp[1], udp[2], tcp[0], tcp[1], tcp[2]);
     }
 
+    
+    
+    std::string true_mac_address = find_mac();
+    if (!ble_filename.empty()) {
+        find_local_ipv4_for_ble ();
+        int count = ble_update(ble_filename.c_str());
+        LOGI("Bluetooth LE advertising data (%d bytes) written to %s", count, ble_filename.c_str());
+    }
+
     if (!use_random_hw_addr) {
         if (strlen(mac_address.c_str()) == 0) {
-            mac_address = find_mac();
-            LOGI("using system MAC address %s",mac_address.c_str());	    
+            mac_address = true_mac_address;
+            if (!mac_address.empty()) {
+                LOGI("using system MAC address %s as immutable deviceID",
+                     mac_address.c_str());
+            }
         } else {
-            LOGI("using user-set MAC address %s",mac_address.c_str());
+            LOGI("using user-set MAC address %s as persistent deviceiD until changed",
+                  mac_address.c_str());
         }
     }
-    if (mac_address.empty()) {
-        srand(time(NULL) * getpid());
+    true_mac_address.erase();
+    if (use_random_hw_addr || mac_address.empty()) {
         mac_address = random_mac();
-        LOGI("using randomly-generated MAC address %s",mac_address.c_str());
+        LOGI("using randomly-generated MAC address %s as non-persistent one-time deviceID",
+              mac_address.c_str());
     }
     parse_hw_addr(mac_address, server_hw_addr);
+
 
     if (coverart_filename.length()) {
         LOGI("any AirPlay audio cover-art will be written to file  %s",coverart_filename.c_str());
@@ -2903,6 +3197,9 @@ int main (int argc, char *argv[]) {
     }
     if (metadata_filename.length()) {
 	remove (metadata_filename.c_str());
+    }
+    if (ble_filename.length()) {
+	remove (ble_filename.c_str());
     }
 #ifdef DBUS
     if (dbus_connection) {
