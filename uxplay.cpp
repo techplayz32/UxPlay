@@ -1960,25 +1960,33 @@ static int register_dnssd() {
     uint64_t features;
     
     if ((dnssd_error = dnssd_register_raop(dnssd, raop_port))) {
-        if (dnssd_error == -65537) {
-             LOGE("No DNS-SD Server found (DNSServiceRegister call returned kDNSServiceErr_Unknown)");
-        } else if (dnssd_error == -65548) {
-            LOGE("DNSServiceRegister call returned kDNSServiceErr_NameConflict");
-            LOGI("Is another instance of %s running with the same DeviceID (MAC address) or using same network ports?",
-                 DEFAULT_NAME);
-            LOGI("Use options -m ... and -p ... to allow multiple instances of %s to run concurrently", DEFAULT_NAME); 
+        if (ble_filename.empty()) {
+            if (dnssd_error == -65537) {
+                LOGE("No DNS-SD Server found (DNSServiceRegister call returned kDNSServiceErr_Unknown)");
+            } else if (dnssd_error == -65548) {
+                LOGE("DNSServiceRegister call returned kDNSServiceErr_NameConflict");
+                LOGI("Is another instance of %s running with the same DeviceID (MAC address) or using same network ports?",
+                     DEFAULT_NAME);
+                LOGI("Use options -m ... and -p ... to allow multiple instances of %s to run concurrently", DEFAULT_NAME); 
+            } else {
+                LOGE("dnssd_register_raop failed with error code %d\n"
+                     "mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) "
+                     "(see Apple's dns_sd.h)", dnssd_error);
+            }
+            return -3;
         } else {
-             LOGE("dnssd_register_raop failed with error code %d\n"
-                  "mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) "
-                  "(see Apple's dns_sd.h)", dnssd_error);
+            LOGI ("DNS-SD registration failed (_raop._txt); continuing because Bluetooth LE Service Discovery was selected");
         }
-        return -3;
     }
     if ((dnssd_error = dnssd_register_airplay(dnssd, airplay_port))) {
-        LOGE("dnssd_register_airplay failed with error code %d\n"
-             "mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) "
-             "(see Apple's dns_sd.h)", dnssd_error);
-        return -4;
+        if (ble_filename.empty()) {
+            LOGE("dnssd_register_airplay failed with error code %d\n"
+                 "mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) "
+                 "(see Apple's dns_sd.h)", dnssd_error);
+            return -4;
+        } else {
+            LOGI ("DNS-SD registration failed (_airplay._txt); continuing because Bluetooth LE Service Discovery was selected");
+        }  
     }
 
     LOGD("register_dnssd: advertised AirPlay service with \"Features\" code = 0x%llX",
