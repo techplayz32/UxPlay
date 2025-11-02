@@ -1,0 +1,190 @@
+name: Windows Build CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-libplist
+          mingw-w64-ucrt-x86_64-gstreamer
+          mingw-w64-ucrt-x86_64-gst-plugins-base
+          mingw-w64-ucrt-x86_64-gst-libav
+          mingw-w64-ucrt-x86_64-gst-plugins-good
+          mingw-w64-ucrt-x86_64-gst-plugins-bad
+          make
+          ninja
+    
+    - name: Download and extract Bonjour SDK
+      shell: powershell
+      run: |
+        $bonjourUrl = "https://developer.apple.com/download/all/?q=Bonjour%20SDK"
+        # Note: This is a placeholder. The actual Bonjour SDK requires Apple Developer login
+        # You may need to cache this or store it in your repository
+        Write-Host "Please ensure Bonjour SDK is available at C:\Program Files\Bonjour SDK"
+        Write-Host "You can download it from softpedia.com or Apple Developer site"
+        
+        # For CI, you might want to cache the SDK or include it in your repo
+        # Alternatively, download from a mirror:
+        # Invoke-WebRequest -Uri "https://example.com/BonjourSDKSetup.exe" -OutFile "BonjourSDK.exe"
+        # Start-Process -FilePath "BonjourSDK.exe" -ArgumentList "/quiet" -Wait
+    
+    - name: Verify Bonjour SDK installation
+      shell: powershell
+      run: |
+        if (Test-Path "C:\Program Files\Bonjour SDK") {
+          Write-Host "Bonjour SDK found"
+        } else {
+          Write-Host "::warning::Bonjour SDK not found. Build may fail."
+          Write-Host "Creating dummy directory for demonstration"
+          New-Item -Path "C:\Program Files\Bonjour SDK" -ItemType Directory -Force
+        }
+    
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. -G "Ninja" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=$HOME/../../ucrt64
+    
+    - name: Build
+      run: |
+        cd build
+        ninja
+    
+    - name: Install
+      run: |
+        cd build
+        cmake --install . --prefix $HOME/../../ucrt64
+    
+    - name: Package artifacts
+      shell: powershell
+      run: |
+        # Create release directory
+        New-Item -Path "release" -ItemType Directory -Force
+        
+        # Copy executable
+        Copy-Item "build/uxplay.exe" "release/" -ErrorAction SilentlyContinue
+        
+        # Copy documentation
+        Copy-Item "README.md" "release/" -ErrorAction SilentlyContinue
+        Copy-Item "LICENSE" "release/" -ErrorAction SilentlyContinue
+        
+        # Copy dependencies (GStreamer DLLs)
+        $gstPath = "C:\msys64\ucrt64\bin"
+        if (Test-Path $gstPath) {
+          $dlls = @(
+            "libgstreamer-1.0-0.dll",
+            "libgstbase-1.0-0.dll",
+            "libgstapp-1.0-0.dll",
+            "libgstvideo-1.0-0.dll",
+            "libgstaudio-1.0-0.dll",
+            "libglib-2.0-0.dll",
+            "libgobject-2.0-0.dll",
+            "libgio-2.0-0.dll",
+            "libgmodule-2.0-0.dll",
+            "libintl-8.dll",
+            "libwinpthread-1.dll",
+            "libgcc_s_seh-1.dll",
+            "libstdc++-6.dll",
+            "liborc-0.4-0.dll",
+            "libplist-2.0-4.dll",
+            "libssl-3-x64.dll",
+            "libcrypto-3-x64.dll"
+          )
+          
+          foreach ($dll in $dlls) {
+            $srcPath = Join-Path $gstPath $dll
+            if (Test-Path $srcPath) {
+              Copy-Item $srcPath "release/" -ErrorAction SilentlyContinue
+            }
+          }
+        }
+        
+        # Create README for Windows
+        @"
+UxPlay for Windows
+==================
+
+Prerequisites:
+- Bonjour Service (install from Apple or included installer)
+- Firewall rules allowing UxPlay.exe
+
+Running UxPlay:
+1. Open Command Prompt or PowerShell
+2. Navigate to this directory
+3. Run: uxplay.exe
+
+For more options, run: uxplay.exe -h
+
+See README.md for full documentation.
+"@ | Out-File -FilePath "release/README-WINDOWS.txt" -Encoding UTF8
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: uxplay-windows-ucrt64
+        path: release/
+        if-no-files-found: warn
+    
+    - name: Create release archive
+      if: startsWith(github.ref, 'refs/tags/')
+      shell: powershell
+      run: |
+        Compress-Archive -Path release/* -DestinationPath uxplay-windows-${{ github.ref_name }}.zip
+    
+    - name: Upload release archive
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: uxplay-windows-release-${{ github.ref_name }}
+        path: uxplay-windows-${{ github.ref_name }}.zip
+
+  test-windows:
+    needs: build-windows
+    runs-on: windows-latest
+    if: false  # Disable by default - enable when you have tests
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: uxplay-windows-ucrt64
+        path: uxplay
+    
+    - name: Test executable
+      shell: powershell
+      run: |
+        cd uxplay
+        if (Test-Path "uxplay.exe") {
+          Write-Host "Testing uxplay.exe..."
+          # Add your tests here
+          # ./uxplay.exe -h
+        } else {
+          Write-Host "::error::uxplay.exe not found"
+          exit 1
+        }
