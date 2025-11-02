@@ -550,6 +550,9 @@ static gboolean x11_window_callback(gpointer loop) {
     return FALSE;
 }
 
+#ifdef _WIN32
+
+#else
 static gboolean sigint_callback(gpointer loop) {
     relaunch_video = false;
     g_main_loop_quit((GMainLoop *) loop);
@@ -561,6 +564,7 @@ static gboolean sigterm_callback(gpointer loop) {
     g_main_loop_quit((GMainLoop *) loop);
     return TRUE;
 }
+#endif
 
 #ifdef _WIN32
 struct signal_handler {
@@ -665,8 +669,12 @@ static void main_loop()  {
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
     guint video_reset_watch_id = g_timeout_add(100, (GSourceFunc) video_reset_callback, (gpointer) loop);
+#ifdef _WIN32
+
+#else
     guint sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
     guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
+#endif
     g_main_loop_run(loop);
 
     for (int i = 0; i < n_video_renderers; i++) {
@@ -676,8 +684,12 @@ static void main_loop()  {
         if (gst_audio_bus_watch_id[i] > 0) g_source_remove(gst_audio_bus_watch_id[i]);
     }
     if (gst_x11_window_id > 0) g_source_remove(gst_x11_window_id);
+#ifdef _WIN32
+
+#else
     if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
     if (sigterm_watch_id > 0) g_source_remove(sigterm_watch_id);
+#endif
     if (reset_watch_id > 0) g_source_remove(reset_watch_id);
     if (progress_id > 0) g_source_remove(progress_id);
     if (video_reset_watch_id > 0) g_source_remove(video_reset_watch_id);
@@ -2991,7 +3003,6 @@ int main (int argc, char *argv[]) {
     reconnect:
     compression_type = 0;
     close_window = new_window_closing_behavior;
-
     main_loop();
     if (relaunch_video) {
         if (reset_httpd) {
