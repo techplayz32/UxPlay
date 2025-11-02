@@ -126,7 +126,7 @@ jobs:
         }
         
         # Create README for Windows
-        @"
+        $readmeContent = @"
 UxPlay for Windows
 ==================
 
@@ -142,7 +142,8 @@ Running UxPlay:
 For more options, run: uxplay.exe -h
 
 See README.md for full documentation.
-"@ | Out-File -FilePath "release/README-WINDOWS.txt" -Encoding UTF8
+"@
+        $readmeContent | Out-File -FilePath "release/README-WINDOWS.txt" -Encoding UTF8
     
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
