@@ -127,22 +127,22 @@ jobs:
         
         # Create README for Windows
         $readmeContent = @"
-UxPlay for Windows
-==================
+        UxPlay for Windows
+        ==================
 
-Prerequisites:
-- Bonjour Service (install from Apple or included installer)
-- Firewall rules allowing UxPlay.exe
+        Prerequisites:
+        - Bonjour Service (install from Apple or included installer)
+        - Firewall rules allowing UxPlay.exe
 
-Running UxPlay:
-1. Open Command Prompt or PowerShell
-2. Navigate to this directory
-3. Run: uxplay.exe
+        Running UxPlay:
+        1. Open Command Prompt or PowerShell
+        2. Navigate to this directory
+        3. Run: uxplay.exe
 
-For more options, run: uxplay.exe -h
+        For more options, run: uxplay.exe -h
 
-See README.md for full documentation.
-"@
+        See README.md for full documentation.
+        "@
         $readmeContent | Out-File -FilePath "release/README-WINDOWS.txt" -Encoding UTF8
     
     - name: Upload build artifacts
